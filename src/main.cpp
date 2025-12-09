@@ -99,17 +99,37 @@ const wchar_t* GetOutTypeString(USHORT outType)
     }
 }
 
+// Case-insensitive substring search
+bool ContainsSubstringIgnoreCase(const wchar_t* str, const wchar_t* substr)
+{
+    if (!str || !substr) return false;
+
+    size_t strLen = wcslen(str);
+    size_t substrLen = wcslen(substr);
+
+    if (substrLen > strLen) return false;
+
+    for (size_t i = 0; i <= strLen - substrLen; i++)
+    {
+        if (_wcsnicmp(str + i, substr, substrLen) == 0)
+            return true;
+    }
+    return false;
+}
+
 void PrintUsage(const wchar_t* programName)
 {
-    wprintf(L"Usage: %ls <ProviderName> [EventName]\n", programName);
+    wprintf(L"Usage: %ls <ProviderName> [EventFilter] [-properties]\n", programName);
     wprintf(L"\n");
     wprintf(L"  ProviderName  - Name of the ETW provider (e.g., Microsoft-Windows-Kernel-Process)\n");
-    wprintf(L"  EventName     - Optional: Name of a specific event to show properties for\n");
-    wprintf(L"                  If not specified, lists all events for the provider\n");
+    wprintf(L"  EventFilter   - Optional: Substring filter for event names (case insensitive)\n");
+    wprintf(L"                  Matches events containing the filter text\n");
+    wprintf(L"  -properties   - Show detailed property information for each event\n");
     wprintf(L"\n");
     wprintf(L"Examples:\n");
     wprintf(L"  %ls Microsoft-Windows-Kernel-Process\n", programName);
-    wprintf(L"  %ls Microsoft-Windows-Kernel-Process ProcessStart\n", programName);
+    wprintf(L"  %ls Microsoft-Windows-Kernel-Process Process\n", programName);
+    wprintf(L"  %ls Microsoft-Windows-Kernel-Process Start -properties\n", programName);
 }
 
 // Get provider GUID from provider name
@@ -207,104 +227,89 @@ const wchar_t* GetEventDisplayName(TRACE_EVENT_INFO* eventInfo, wchar_t* fallbac
     return fallbackBuffer;
 }
 
-// Print event properties
-void PrintEventProperties(TRACE_EVENT_INFO* eventInfo, const wchar_t* filterEventName)
+// Check if event matches filter (substring, case insensitive)
+bool EventMatchesFilter(TRACE_EVENT_INFO* eventInfo, const wchar_t* filterEventName, wchar_t* nameFallback, size_t fallbackSize)
 {
-    wchar_t nameFallback[256];
-    const wchar_t* eventName = GetEventDisplayName(eventInfo, nameFallback, _countof(nameFallback));
+    if (filterEventName == NULL)
+        return true;
 
+    const wchar_t* eventName = GetEventDisplayName(eventInfo, nameFallback, fallbackSize);
     const wchar_t* taskName = GetStringFromOffset(eventInfo, eventInfo->TaskNameOffset);
     const wchar_t* opcodeName = GetStringFromOffset(eventInfo, eventInfo->OpcodeNameOffset);
 
-    // If filtering by event name, check against event name, task name, and opcode name
-    if (filterEventName != NULL)
-    {
-        bool match = false;
-        if (_wcsicmp(eventName, filterEventName) == 0)
-            match = true;
-        if (taskName && _wcsicmp(taskName, filterEventName) == 0)
-            match = true;
-        if (opcodeName && _wcsicmp(opcodeName, filterEventName) == 0)
-            match = true;
+    if (ContainsSubstringIgnoreCase(eventName, filterEventName))
+        return true;
+    if (ContainsSubstringIgnoreCase(taskName, filterEventName))
+        return true;
+    if (ContainsSubstringIgnoreCase(opcodeName, filterEventName))
+        return true;
 
-        if (!match)
-            return;
-    }
+    return false;
+}
 
-    wprintf(L"\n");
-    wprintf(L"================================================================================\n");
-    wprintf(L"Event: %ls\n", eventName);
+// Print event in single-line format
+void PrintEventLine(TRACE_EVENT_INFO* eventInfo, const wchar_t* filterEventName, bool showProperties)
+{
+    wchar_t nameFallback[256];
 
-    if (taskName)
-    {
-        wprintf(L"Task: %ls\n", taskName);
-    }
-
-    if (opcodeName)
-    {
-        wprintf(L"Opcode: %ls\n", opcodeName);
-    }
-
-    wprintf(L"Event ID: %u, Version: %u\n", eventInfo->EventDescriptor.Id, eventInfo->EventDescriptor.Version);
-    wprintf(L"Channel: %u, Level: %u, Task: %u, Opcode: %u\n",
-        eventInfo->EventDescriptor.Channel,
-        eventInfo->EventDescriptor.Level,
-        eventInfo->EventDescriptor.Task,
-        eventInfo->EventDescriptor.Opcode);
-    wprintf(L"Keywords: 0x%016llX\n", eventInfo->EventDescriptor.Keyword);
-    wprintf(L"--------------------------------------------------------------------------------\n");
-    wprintf(L"Properties (%u):\n", eventInfo->TopLevelPropertyCount);
-
-    if (eventInfo->TopLevelPropertyCount == 0)
-    {
-        wprintf(L"  (no properties)\n");
+    if (!EventMatchesFilter(eventInfo, filterEventName, nameFallback, _countof(nameFallback)))
         return;
+
+    const wchar_t* eventName = GetEventDisplayName(eventInfo, nameFallback, _countof(nameFallback));
+    const wchar_t* taskName = GetStringFromOffset(eventInfo, eventInfo->TaskNameOffset);
+    const wchar_t* opcodeName = GetStringFromOffset(eventInfo, eventInfo->OpcodeNameOffset);
+
+    // Build task/opcode suffix if different from event name
+    wchar_t suffix[128] = L"";
+    if (taskName && opcodeName && wcscmp(eventName, taskName) != 0)
+    {
+        swprintf_s(suffix, _countof(suffix), L" [%ls/%ls]", taskName, opcodeName);
+    }
+    else if (taskName && wcscmp(eventName, taskName) != 0)
+    {
+        swprintf_s(suffix, _countof(suffix), L" [%ls]", taskName);
     }
 
-    for (ULONG i = 0; i < eventInfo->TopLevelPropertyCount; i++)
+    // Single line: EventName (ID:X v:Y) Keywords:0xNNN [Task/Opcode] (N properties)
+    wprintf(L"%-40ls  ID:%-4u v:%-2u  Keywords:0x%016llX%ls  (%u props)\n",
+        eventName,
+        eventInfo->EventDescriptor.Id,
+        eventInfo->EventDescriptor.Version,
+        eventInfo->EventDescriptor.Keyword,
+        suffix,
+        eventInfo->TopLevelPropertyCount);
+
+    if (showProperties && eventInfo->TopLevelPropertyCount > 0)
     {
-        EVENT_PROPERTY_INFO* propInfo = &eventInfo->EventPropertyInfoArray[i];
-        const wchar_t* propName = (const wchar_t*)((BYTE*)eventInfo + propInfo->NameOffset);
+        for (ULONG i = 0; i < eventInfo->TopLevelPropertyCount; i++)
+        {
+            EVENT_PROPERTY_INFO* propInfo = &eventInfo->EventPropertyInfoArray[i];
+            const wchar_t* propName = (const wchar_t*)((BYTE*)eventInfo + propInfo->NameOffset);
 
-        wprintf(L"\n  [%u] %ls\n", i, propName);
-        wprintf(L"      InType:  %ls (%u)\n", GetInTypeString(propInfo->nonStructType.InType), propInfo->nonStructType.InType);
-        wprintf(L"      OutType: %ls (%u)\n", GetOutTypeString(propInfo->nonStructType.OutType), propInfo->nonStructType.OutType);
+            // Build additional info string
+            wchar_t extra[128] = L"";
+            if (propInfo->Flags & PropertyStruct)
+            {
+                swprintf_s(extra, _countof(extra), L" struct[%u members]", propInfo->structType.NumOfStructMembers);
+            }
+            else if (propInfo->nonStructType.MapNameOffset > 0)
+            {
+                const wchar_t* mapName = (const wchar_t*)((BYTE*)eventInfo + propInfo->nonStructType.MapNameOffset);
+                swprintf_s(extra, _countof(extra), L" map:%ls", mapName);
+            }
 
-        if (propInfo->Flags & PropertyStruct)
-        {
-            wprintf(L"      Flags: STRUCT (contains %u members starting at index %u)\n",
-                propInfo->structType.NumOfStructMembers,
-                propInfo->structType.StructStartIndex);
-        }
-
-        if (propInfo->Flags & PropertyParamLength)
-        {
-            wprintf(L"      Length: Determined by property at index %u\n", propInfo->lengthPropertyIndex);
-        }
-        else if (propInfo->length > 0)
-        {
-            wprintf(L"      Length: %u bytes\n", propInfo->length);
-        }
-
-        if (propInfo->Flags & PropertyParamCount)
-        {
-            wprintf(L"      Count: Determined by property at index %u\n", propInfo->countPropertyIndex);
-        }
-        else if (propInfo->count > 1)
-        {
-            wprintf(L"      Count: %u (array)\n", propInfo->count);
-        }
-
-        if (propInfo->nonStructType.MapNameOffset > 0)
-        {
-            const wchar_t* mapName = (const wchar_t*)((BYTE*)eventInfo + propInfo->nonStructType.MapNameOffset);
-            wprintf(L"      Map: %ls\n", mapName);
+            // Single line per property: indented name, InType -> OutType, extras
+            wprintf(L"    %-30ls  %ls -> %ls%ls\n",
+                propName,
+                GetInTypeString(propInfo->nonStructType.InType),
+                GetOutTypeString(propInfo->nonStructType.OutType),
+                extra);
         }
     }
 }
 
 // Enumerate and print events for a provider
-ULONG EnumerateProviderEvents(const GUID* providerGuid, const wchar_t* filterEventName)
+ULONG EnumerateProviderEvents(const GUID* providerGuid, const wchar_t* filterEventName, bool showProperties)
 {
     ULONG status = ERROR_SUCCESS;
     PROVIDER_EVENT_INFO* eventInfoBuffer = NULL;
@@ -334,9 +339,9 @@ ULONG EnumerateProviderEvents(const GUID* providerGuid, const wchar_t* filterEve
         return status;
     }
 
-    wprintf(L"Found %u events\n", eventInfoBuffer->NumberOfEvents);
+    wprintf(L"Found %u events\n\n", eventInfoBuffer->NumberOfEvents);
 
-    bool foundFilteredEvent = false;
+    ULONG matchCount = 0;
 
     // Iterate through each event
     for (ULONG i = 0; i < eventInfoBuffer->NumberOfEvents; i++)
@@ -361,23 +366,12 @@ ULONG EnumerateProviderEvents(const GUID* providerGuid, const wchar_t* filterEve
 
         if (status == ERROR_SUCCESS && traceEventInfo != NULL)
         {
-            // Check if this matches filter before printing
-            if (filterEventName != NULL)
+            wchar_t nameFallback[256];
+            if (EventMatchesFilter(traceEventInfo, filterEventName, nameFallback, _countof(nameFallback)))
             {
-                wchar_t nameFallback[256];
-                const wchar_t* eventName = GetEventDisplayName(traceEventInfo, nameFallback, _countof(nameFallback));
-                const wchar_t* taskName = GetStringFromOffset(traceEventInfo, traceEventInfo->TaskNameOffset);
-                const wchar_t* opcodeName = GetStringFromOffset(traceEventInfo, traceEventInfo->OpcodeNameOffset);
-
-                if (_wcsicmp(eventName, filterEventName) == 0)
-                    foundFilteredEvent = true;
-                else if (taskName && _wcsicmp(taskName, filterEventName) == 0)
-                    foundFilteredEvent = true;
-                else if (opcodeName && _wcsicmp(opcodeName, filterEventName) == 0)
-                    foundFilteredEvent = true;
+                matchCount++;
+                PrintEventLine(traceEventInfo, filterEventName, showProperties);
             }
-
-            PrintEventProperties(traceEventInfo, filterEventName);
         }
 
         free(traceEventInfo);
@@ -385,10 +379,15 @@ ULONG EnumerateProviderEvents(const GUID* providerGuid, const wchar_t* filterEve
 
     free(eventInfoBuffer);
 
-    if (filterEventName != NULL && !foundFilteredEvent)
+    if (filterEventName != NULL && matchCount == 0)
     {
-        wprintf(L"\nEvent '%ls' not found in this provider.\n", filterEventName);
+        wprintf(L"No events matching '%ls' found in this provider.\n", filterEventName);
         return ERROR_NOT_FOUND;
+    }
+
+    if (filterEventName != NULL)
+    {
+        wprintf(L"\n%u events matched filter '%ls'\n", matchCount, filterEventName);
     }
 
     return ERROR_SUCCESS;
@@ -403,10 +402,24 @@ int wmain(int argc, wchar_t* argv[])
     }
 
     const wchar_t* providerName = argv[1];
-    const wchar_t* eventName = (argc >= 3) ? argv[2] : NULL;
+    const wchar_t* eventFilter = NULL;
+    bool showProperties = false;
 
-    wprintf(L"ETW Event Property Viewer\n");
-    wprintf(L"========================\n\n");
+    // Parse arguments
+    for (int i = 2; i < argc; i++)
+    {
+        if (_wcsicmp(argv[i], L"-properties") == 0)
+        {
+            showProperties = true;
+        }
+        else if (eventFilter == NULL)
+        {
+            eventFilter = argv[i];
+        }
+    }
+
+    wprintf(L"ETW Event Query\n");
+    wprintf(L"===============\n\n");
 
     // Get provider GUID from name
     GUID providerGuid = {0};
@@ -431,13 +444,15 @@ int wmain(int argc, wchar_t* argv[])
     wprintf(L"Provider: %ls\n", providerName);
     wprintf(L"GUID: %ls\n", guidStr);
 
-    if (eventName)
+    if (eventFilter)
     {
-        wprintf(L"Filtering for event: %ls\n", eventName);
+        wprintf(L"Filter: %ls\n", eventFilter);
     }
 
+    wprintf(L"\n");
+
     // Enumerate events
-    status = EnumerateProviderEvents(&providerGuid, eventName);
+    status = EnumerateProviderEvents(&providerGuid, eventFilter, showProperties);
 
     if (status != ERROR_SUCCESS && status != ERROR_NOT_FOUND)
     {
